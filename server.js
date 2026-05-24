@@ -427,68 +427,130 @@ app.post('/api/chat', async (req, res) => {
     const { message, context } = req.body;
     if (!message) return res.status(400).json({ error: 'message required' });
 
-    // ── Detect language from user message ──────────────────────────────────
-    // Simple heuristic: if message contains Malayalam Unicode range, use Malayalam
-    const hasMalayalam = /[\u0D00-\u0D7F]/.test(message);
-    const lang = hasMalayalam ? 'malayalam' : 'english';
+    // ── Language detection ─────────────────────────────────────────────────
+    // Check for Malayalam Unicode range (0D00–0D7F)
+    const malayalamChars = (message.match(/[\u0D00-\u0D7F]/g) || []).length;
+    const totalChars     = message.replace(/\s/g, '').length;
+    const malayalamRatio = totalChars > 0 ? malayalamChars / totalChars : 0;
 
-    // ── Fetch relevant colleges from DB ────────────────────────────────────
-    let dbContext = '';
+    // Only treat as Malayalam if MORE THAN 40% of characters are Malayalam script
+    // This prevents English messages with one Malayalam word being detected as Malayalam
+    const lang = malayalamRatio > 0.4 ? 'malayalam' : 'english';
+
+    // ── Smart keyword college search ───────────────────────────────────────
+    // Extract meaningful keywords from the message (remove common words)
+    const stopWords = ['the','a','an','is','are','what','which','how','much','fee','of',
+                       'in','at','for','and','or','to','about','tell','me','i','my',
+                       'want','know','please','can','you','this','that','college',
+                       'university','institute','school'];
+
+    const keywords = message
+      .toLowerCase()
+      .replace(/[?.,!]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !stopWords.includes(w));
+
+    // ── Fetch colleges for context ─────────────────────────────────────────
     let collegeList = [];
 
-    // Always fetch some colleges for context
-    const q = {};
-    if (context?.field)    q['courses.field'] = context.field;
-    if (context?.district) q.district = context.district;
+    // Strategy 1: if context field/district provided, fetch those colleges
+    if (context?.field || context?.district) {
+      const q = {};
+      if (context.field)    q['courses.field'] = context.field;
+      if (context.district) q.district = context.district;
+      collegeList = await College.find(q)
+        .select('name short district type naac fees courses affiliation website management_quota_fee rating established')
+        .limit(8).lean();
+    }
 
-    const colleges = await College.find(
-      Object.keys(q).length > 0 ? q : {}
-    )
-      .select('name short district type naac fees courses affiliation website established management_quota_fee rating')
-      .limit(8)
-      .lean();
+    // Strategy 2: keyword search against college name and short name
+    // Build a regex from each keyword and search name/short fields
+    if (keywords.length > 0) {
+      // Try each keyword as a partial name match
+      const keywordRegexes = keywords.map(k => ({
+        $or: [
+          { name:  { $regex: k, $options: 'i' } },
+          { short: { $regex: k, $options: 'i' } },
+          { district: { $regex: k, $options: 'i' } },
+          { 'courses.name': { $regex: k, $options: 'i' } },
+        ]
+      }));
 
-    collegeList = colleges;
+      const keywordMatches = await College.find({ $or: keywordRegexes.flatMap(r => r.$or) })
+        .select('name short district type naac fees courses affiliation website management_quota_fee rating established')
+        .limit(6).lean();
 
-    if (colleges.length > 0) {
-      dbContext = '\n\n=== KERALA COLLEGE DATABASE ===\n' +
-        colleges.map((c, i) => {
-          const semAnnual  = c.fees.semester  * 2;
-          const busAnnual  = c.fees.bus       * 2;
+      // Merge with existing list, avoid duplicates
+      const existingIds = new Set(collegeList.map(c => c._id.toString()));
+      keywordMatches.forEach(c => {
+        if (!existingIds.has(c._id.toString())) {
+          collegeList.push(c);
+          existingIds.add(c._id.toString());
+        }
+      });
+    }
+
+    // Strategy 3: if still no colleges found, fetch a general sample
+    if (collegeList.length === 0) {
+      collegeList = await College.find({})
+        .select('name short district type naac fees courses affiliation website management_quota_fee rating')
+        .limit(6).lean();
+    }
+
+    // ── Build database context string ──────────────────────────────────────
+    let dbContext = '';
+    if (collegeList.length > 0) {
+      dbContext = '\n\n=== KERALA COLLEGE DATABASE (use this for fee and college questions) ===\n' +
+        collegeList.map((c, i) => {
+          const semAnnual  = c.fees.semester * 2;
+          const busAnnual  = c.fees.bus      * 2;
           const total      = semAnnual + busAnnual + c.fees.hostel + c.fees.food;
-          const courseList = c.courses.map(x => `${x.name}(${x.seats} seats)`).join(', ');
-          return `[${i+1}] ${c.name}
-  District: ${c.district} | Type: ${c.type} | NAAC: ${c.naac} | Rating: ${c.rating}/5
+          const courseList = c.courses.map(x => `${x.name} (${x.seats} seats)`).join(', ');
+          return `[${i+1}] ${c.name} | Short: ${c.short}
+  Location: ${c.district} | Type: ${c.type} | NAAC: ${c.naac} | Rating: ${c.rating}/5
   Courses: ${courseList}
-  Fees: Semester=₹${semAnnual}/yr, Bus=₹${busAnnual}/yr, Hostel=₹${c.fees.hostel}/yr, Food=₹${c.fees.food}/yr
+  Fees → Semester: ₹${semAnnual}/yr | Bus: ₹${busAnnual}/yr | Hostel: ₹${c.fees.hostel}/yr | Food: ₹${c.fees.food}/yr
   Total Annual Cost: ~₹${total.toLocaleString()}
-  ${c.management_quota_fee > 0 ? `Management Quota: ₹${c.management_quota_fee}` : 'Govt/Merit seats only'}
+  ${c.management_quota_fee > 0 ? `Management Quota Fee: ₹${c.management_quota_fee}` : 'No management quota (Govt/Merit only)'}
   Website: ${c.website}`;
         }).join('\n\n');
     }
 
     // ── System prompt ──────────────────────────────────────────────────────
-    const SYSTEM = `You are Kerala Career Compass, a specialized career guidance assistant ONLY for Kerala students.
+    const langInstruction = lang === 'malayalam'
+      ? 'IMPORTANT: The user is writing in Malayalam. You MUST reply in Malayalam script only. Do not use English words except for technical terms like B.Tech, NEET, KEAM, NAAC.'
+      : 'IMPORTANT: The user is writing in English. You MUST reply in English only. Do not use Malayalam.';
 
-STRICT RULES — NEVER break these:
-1. You ONLY answer questions about: Kerala colleges, courses, fees, career paths after SSLC/Plus Two/ITI/Diploma/B.Tech/M.Tech, entrance exams (KEAM, NEET, GATE, CAT, CLAT, LET, KMAT, KAU entrance), college comparisons, NAAC grades.
-2. If asked ANYTHING else (cricket, cooking, politics, general knowledge, jokes, etc.) — politely say "I can only help with Kerala career and college guidance."
-3. LANGUAGE RULE: The user is writing in ${lang}. You MUST respond in ${lang === 'malayalam' ? 'Malayalam (Malayalam script only, not transliteration)' : 'English'}.
-4. Base your answers PRIMARILY on the college database provided below. Only use general knowledge for entrance exam details not in the database.
-5. For fee questions: ALWAYS show a structured breakdown, not a paragraph.
-6. For college comparisons: use a structured format with clear sections.
-7. Keep answers practical and simple enough for a school student to understand.
-8. Always add at the end: "⚠️ Fees change yearly — verify directly with the college."
-9. NAAC grades: A+ = best, A = very good, B+ = good, B = average.
-10. Explain Government vs Aided vs Self-financing: Govt fees are lowest (₹3k–6k/semester), Aided are moderate, Self-financing are highest.
-${dbContext}
+    const SYSTEM = `You are Kerala Career Compass, a friendly career guidance assistant for Kerala students. You are like a helpful, knowledgeable senior who genuinely wants to guide students to the right path.
 
-FORMAT RULES for structured responses:
-- For fee details: use bullet points with ₹ symbols
-- For college lists: number them 1, 2, 3...
-- For career paths: use arrow format → like SSLC → Plus Two → B.Tech
-- For comparisons: use a table-like structure with | separators
-- Keep responses under 300 words`;
+${langInstruction}
+
+TOPIC BOUNDARY — only discuss:
+✅ Career paths after SSLC, Plus Two, ITI, Diploma, B.Tech, M.Tech
+✅ Kerala colleges — fees, NAAC grades, courses, seats, locations
+✅ Entrance exams — KEAM, NEET, GATE, CAT, CLAT, KLEE, LET, KMAT, KAU, JEE
+✅ Course comparisons — B.Tech vs Diploma, MBBS vs Nursing, B.Com vs CA, etc.
+✅ Career scope — job market, salary ranges, industries in Kerala and India
+✅ Admission process — how to apply, important dates, documents needed
+✅ Scholarships — Kerala state scholarships, merit, minority scholarships
+✅ Exam preparation — how to prepare for KEAM, NEET, GATE etc.
+
+❌ For anything outside education and careers, reply: "I'm your Kerala career guide — I can only help with college admissions, career paths, and education. Ask me anything about that! 😊"
+
+COLLEGE SEARCH RULE:
+If the user mentions a partial college name (like "nehru", "cusat", "amrita", "rajagiri") — search the database context below and answer about that specific college. Always match partial names intelligently.
+
+RESPONSE RULES:
+- Be warm, encouraging, specific — like a helpful friend not a robot
+- For fee questions → structured breakdown with ₹ values from database
+- For career path questions → use step format: SSLC → Plus Two → B.Tech
+- For college questions → use data from the database context provided
+- For exam prep, career scope → use real knowledge, give actionable advice
+- For "which is better" → give a real opinion with clear reasoning
+- Keep responses under 250 words
+- End fee answers with: ⚠️ Fees change yearly — verify directly with the college.
+- Never say "based on the database" or "I cannot find in database" — just answer naturally
+${dbContext}`;
 
     // ── Call Groq API ──────────────────────────────────────────────────────
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -500,7 +562,7 @@ FORMAT RULES for structured responses:
       body: JSON.stringify({
         model: 'llama-3.1-8b-instant',
         max_tokens: 600,
-        temperature: 0.3,   // lower = more focused, less creative
+        temperature: 0.4,
         messages: [
           { role: 'system', content: SYSTEM },
           { role: 'user',   content: message },
@@ -514,10 +576,11 @@ FORMAT RULES for structured responses:
       return res.status(500).json({ error: 'AI unavailable. Try again shortly.' });
     }
 
-    const data = await groqRes.json();
+    const data  = await groqRes.json();
     const reply = data.choices[0].message.content;
 
     res.json({ reply, lang });
+
   } catch (err) {
     console.error('Chat error:', err);
     res.status(500).json({ error: 'AI response failed.' });
